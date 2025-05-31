@@ -8,12 +8,12 @@ from threading import Thread # Import Thread
 
 # --- Configuration ---
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "YOUR_DISCORD_WEBHOOK_URL_HERE")
-FLASK_PORT = int(os.environ.get("FLASK_PORT", 5001))
+FLASK_PORT = int(os.environ.get("FLASK_PORT", 5001)) # Used by Flask's dev server, not Gunicorn directly on Railway
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
 
-# --- Helper Functions (No changes here) ---
+# --- Helper Functions ---
 def hex_to_string(hex_str):
     if hex_str.startswith("0x"):
         hex_str = hex_str[2:]
@@ -27,10 +27,15 @@ def hex_to_string(hex_str):
 def extract_title_from_ancillary(ancillary_data_str):
     if not ancillary_data_str:
         return None
+    # Regex to find "title: " (case-insensitive) and capture until a common delimiter or end of string/line
     match = re.search(r"title:\s*(.*?)(?:,\s*description:|, desc:|resolution_criteria:|\n|$)", ancillary_data_str, re.IGNORECASE | re.DOTALL)
     if match:
         title = match.group(1).strip()
-        return title.replace('\u0000', '').strip()
+        # Clean up potential non-printable characters and excessive length
+        title = title.replace('\u0000', '').strip()
+        if len(title) > 250: # Max title length for Discord embeds is 256
+            title = title[:250] + "..."
+        return title
     return None
 
 def send_to_discord(message_content=None, embeds=None):
@@ -46,21 +51,25 @@ def send_to_discord(message_content=None, embeds=None):
         print("No content or embeds to send to Discord.")
         return False
     try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+        # Set a timeout for the request to Discord (e.g., 10 seconds)
+        response = requests.post(DISCORD_WEBHOOK_URL, json=data, timeout=10)
         response.raise_for_status()
         print(f"Message sent to Discord (Status: {response.status_code})")
         return True
+    except requests.exceptions.Timeout:
+        print(f"Error sending message to Discord: Timeout after 10 seconds.")
+        return False
     except requests.exceptions.RequestException as e:
         print(f"Error sending message to Discord: {e}")
         if hasattr(e, 'response') and e.response is not None:
             print(f"Discord Response Content: {e.response.text}")
         return False
 
-# --- New Function to Handle Processing ---
+# --- Function to Handle Processing in Background ---
 def process_webhook_payload(payload):
     """
-    This function contains all the logic to parse the payload and send a message to Discord.
-    It will be run in a background thread so it doesn't block the response to Alchemy.
+    Parses the payload and sends a message to Discord.
+    Run in a background thread.
     """
     print("--- Background processing started ---")
     try:
@@ -88,15 +97,21 @@ def process_webhook_payload(payload):
                                 extracted_title = extract_title_from_ancillary(ancillary_data_str)
                                 if extracted_title:
                                     human_readable_title = extracted_title
+                                else:
+                                    print(f"Could not extract title from ancillary data: {ancillary_data_str[:100]}...")
+                            else:
+                                print(f"Failed to decode ancillary data hex: {ancillary_data_hex[:100]}...")
+                        else:
+                            print("Ancillary data is empty or '0x'.")
 
                         raw_proposed_price = event_params.get("proposedPrice")
                         disputed_answer = str(raw_proposed_price)
-                        price_value_str = str(raw_proposed_price)
+                        price_value_str = str(raw_proposed_price) # Ensure it's a string for comparison
                         if price_value_str == "0":
                             disputed_answer = "p1 (e.g., NO)"
-                        elif price_value_str == "1000000000000000000":
+                        elif price_value_str == "1000000000000000000": # 1 * 10^18
                             disputed_answer = "p2 (e.g., YES)"
-                        elif price_value_str == "500000000000000000":
+                        elif price_value_str == "500000000000000000":  # 0.5 * 10^18
                             disputed_answer = "p3 (e.g., 0.5/INVALID)"
                         
                         disputer_address = event_params.get("disputer", "N/A")
@@ -105,8 +120,9 @@ def process_webhook_payload(payload):
                         event_timestamp_unix = event_params.get("timestamp")
 
                         tx_hash = activity_item.get("hash", "N/A")
-                        block_num_hex = activity_item.get("blockNum")
+                        block_num_hex = activity_item.get("blockNum") # This comes from Alchemy's payload structure
                         block_num = int(block_num_hex, 16) if block_num_hex else "N/A"
+                        
                         network = payload.get("event", {}).get("network", "ETH_MAINNET").upper()
                         etherscan_base = "https://polygonscan.com" if "POLYGON" in network or "MATIC" in network else "https://etherscan.io"
                         tx_link = f"{etherscan_base}/tx/{tx_hash}" if tx_hash != "N/A" else "N/A"
@@ -115,8 +131,11 @@ def process_webhook_payload(payload):
                         event_time_str = "N/A"
                         if event_timestamp_unix:
                             try:
+                                # Ensure timestamp is treated as an integer
                                 event_time_str = datetime.fromtimestamp(int(event_timestamp_unix), timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
-                            except (ValueError, TypeError): pass
+                            except (ValueError, TypeError) as ts_err:
+                                print(f"Error converting timestamp {event_timestamp_unix}: {ts_err}")
+                                pass
 
                         display_title = human_readable_title if human_readable_title != "N/A" else f"Market Identifier: `{market_identifier_hex}`"
                         
@@ -133,11 +152,22 @@ def process_webhook_payload(payload):
                                 {"name": "Transaction", "value": f"[{tx_hash[:12]}...]({tx_link})", "inline": False},
                             ],
                             "footer": {"text": f"Block: {block_num} | Network: {network}"},
-                            "timestamp": payload.get("createdAt")
+                            "timestamp": payload.get("createdAt") # Use Alchemy's webhook creation timestamp
                         }
                         send_to_discord(embeds=[embed])
+                    else:
+                        print(f"Received event '{event_name}', but not processing as it's not '{TARGET_DISPUTE_EVENT_NAME}'.")
+                else:
+                    # This case might happen if Alchemy couldn't decode the log (e.g., missing ABI for the event)
+                    print("No 'decoded' data found in log_data. Raw log:")
+                    print(json.dumps(log_data, indent=2))
+        else:
+            print("Payload structure not as expected (missing 'event' or 'activity'). Full payload:")
+            print(json.dumps(payload, indent=2))
+            send_to_discord(message_content=f"Received an unhandled webhook structure from Alchemy:\n```json\n{json.dumps(payload, indent=2)}\n```")
+
     except Exception as e:
-        print(f"Error during background processing: {e}")
+        print(f"Error during background processing of webhook payload: {e}")
         # Optionally send an error message to a different Discord webhook for debugging
         # send_to_discord(message_content=f":x: Error processing payload in background: {e}")
 
@@ -148,22 +178,25 @@ def alchemy_webhook_receiver():
     Receives webhook from Alchemy, acknowledges it immediately,
     and starts the actual processing in a background thread.
     """
-    payload = request.json
-    if not payload:
-        print("Received empty or invalid payload.")
-        return jsonify({"status": "error", "message": "Empty or invalid payload"}), 400
+    try:
+        payload = request.json
+        if not payload:
+            print("Received empty or invalid payload at /alchemy-webhook.")
+            return jsonify({"status": "error", "message": "Empty or invalid payload"}), 400
 
-    print(f"--- Received webhook from Alchemy. Starting background processing. ---")
-    
-    # Create and start a new thread to process the payload
-    # The 'args' tuple must have a comma even for one item
-    thread = Thread(target=process_webhook_payload, args=(payload,))
-    thread.start()
+        print(f"--- Received webhook from Alchemy. Starting background processing. ---")
+        
+        thread = Thread(target=process_webhook_payload, args=(payload,))
+        thread.start()
 
-    # Immediately return a success response to Alchemy so it doesn't time out
-    return jsonify({"status": "success", "message": "Webhook received and processing initiated"}), 200
+        return jsonify({"status": "success", "message": "Webhook received and processing initiated"}), 200
+    except Exception as e:
+        # This handles errors in receiving/parsing the initial request, before threading
+        print(f"Error in alchemy_webhook_receiver (before threading): {e}")
+        return jsonify({"status": "error", "message": "Error handling initial request"}), 500
 
-# --- Health Check and Main Execution (No changes here) ---
+
+# --- Health Check and Main Execution ---
 @app.route('/', methods=['GET'])
 def health_check():
     return "Webhook receiver is alive!", 200
@@ -171,6 +204,11 @@ def health_check():
 if __name__ == '__main__':
     if "YOUR_DISCORD_WEBHOOK_URL_HERE" in DISCORD_WEBHOOK_URL:
         print("CRITICAL: Please set your DISCORD_WEBHOOK_URL in the script or as an environment variable.")
-        exit(1)
-    print(f"Starting Flask server on port {FLASK_PORT}...")
-    app.run(host='0.0.0.0', port=FLASK_PORT, debug=True)
+        # For Railway, this check might not be critical if env var is set on the platform
+        # For local dev, it's important.
+        # exit(1) # Commenting out exit for Railway deployments where env var is expected
+
+    # When run directly (python app.py), use Flask's dev server
+    # Gunicorn will be used by Railway based on Procfile or start command
+    print(f"Starting Flask development server on http://0.0.0.0:{FLASK_PORT}...")
+    app.run(host='0.0.0.0', port=FLASK_PORT, debug=False) # Set debug=False for production/Gunicorn
